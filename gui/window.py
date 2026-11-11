@@ -144,6 +144,9 @@ class MainWindow(ctk.CTk):
         # Add keyboard shortcut for log window toggle (Ctrl+L)
         self.bind("<Control-l>", lambda e: self.toggle_log_window())
 
+        # Stop log pollers if the window is destroyed directly (no WM close)
+        self.bind("<Destroy>", self._on_window_destroyed, add="+")
+
         # Add tab change handler for lazy loading OnlyFans tab
         self.tab_view.configure(command=self._on_tab_changed)
 
@@ -200,6 +203,14 @@ class MainWindow(ctk.CTk):
         if self.log_window is not None:
             self.log_window._save_window_state()
 
+        # Stop the background log pollers so Tk does not complain about
+        # pending callbacks on a destroyed window
+        for handler in (self.handlers, self.of_handlers):
+            stop_relay = getattr(handler, "stop_log_relay", None)
+
+            if callable(stop_relay):
+                stop_relay()
+
         # Save GUI state before closing
         self.app_state.save_gui_state()
         if self.of_app_state is not None:
@@ -215,7 +226,14 @@ class MainWindow(ctk.CTk):
             from gui.widgets.log_window import LogWindow
             self.log_window = LogWindow(self)
             self.sections["log"] = self.log_window
-            # OnlyFans tab might not be built yet, handle that in _build_onlyfans_tab
+
+            # The OnlyFans tab keeps its own sections dict; without this the OF
+            # side kept writing to its inline log and the window stayed empty.
+            if self.of_sections is not None:
+                self.of_sections["log"] = self.log_window
+
+            # Show what already happened before the window was opened
+            self._replay_log_history()
         
         if self.log_window.winfo_viewable():
             self.log_window.withdraw()
@@ -242,6 +260,29 @@ class MainWindow(ctk.CTk):
                 self.sections["status"]["log_button"].configure(text="Hide Log")
             if self.of_sections is not None and "status" in self.of_sections and "log_button" in self.of_sections["status"]:
                 self.of_sections["status"]["log_button"].configure(text="Hide Log")
+
+    def _on_window_destroyed(self, event):
+        """Stops the log pollers when the main window is destroyed directly."""
+        if event.widget is not self:
+            return  # ignore child widget destruction events
+
+        for handler in (getattr(self, "handlers", None),
+                        getattr(self, "of_handlers", None)):
+            stop_relay = getattr(handler, "stop_log_relay", None)
+
+            if callable(stop_relay):
+                stop_relay()
+
+    def _replay_log_history(self):
+        """Fill a freshly opened log window with earlier messages."""
+        if self.log_window is None:
+            return
+
+        for handler in (self.handlers, self.of_handlers):
+            replay = getattr(handler, "replay_history_into", None)
+
+            if callable(replay):
+                replay(self.log_window)
 
     def open_log_file(self):
         """Open log file in default text editor"""

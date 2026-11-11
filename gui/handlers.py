@@ -2,7 +2,10 @@
 Event handlers for GUI actions
 """
 
+import queue
 import tkinter.messagebox as messagebox
+from collections import deque
+
 from gui.download_manager import DownloadManager, OnlyFansDownloadManager
 from gui.log_classifier import (
     classify_log_message,
@@ -11,7 +14,135 @@ from gui.log_classifier import (
 )
 
 
-class EventHandlers:
+class LogRelayMixin:
+    """Thread-safe delivery of worker-thread log messages to the GUI.
+
+    Download code runs in a worker thread and calls ``print_info``/``print_error``
+    (routed here through ``textio``). Tk must only be touched from the main
+    thread, so messages are queued and drained by a poller scheduled with
+    ``after()``. Messages are also kept in a bounded history so a log window
+    opened later still shows what happened.
+    """
+
+    LOG_POLL_INTERVAL_MS = 250
+    LOG_HISTORY_SIZE = 1000
+
+    def _init_log_relay(self) -> None:
+        self._log_queue: queue.Queue = queue.Queue()
+        self._log_history: deque = deque(maxlen=self.LOG_HISTORY_SIZE)
+        self._log_poll_after_id = None
+        self._log_relay_stopped = False
+
+        # Badge tracking for log button
+        self.unread_warnings = 0
+        self.unread_errors = 0
+
+        # Start the poller from the main thread (handlers are created there)
+        try:
+            self._log_poll_after_id = self.window.after(
+                self.LOG_POLL_INTERVAL_MS, self._poll_logs
+            )
+        except Exception:
+            # No Tk loop available (e.g. headless tests) - logs still go to file
+            pass
+
+    def stop_log_relay(self) -> None:
+        """Stops the poller (called when the window is being destroyed)."""
+        self._log_relay_stopped = True
+
+        if self._log_poll_after_id is not None:
+            try:
+                self.window.after_cancel(self._log_poll_after_id)
+            except Exception:
+                pass
+
+            self._log_poll_after_id = None
+
+    def on_log(self, message, level="info"):
+        """Queue a log message (safe to call from any thread)."""
+        self._log_queue.put((str(message), level))
+
+    def _poll_logs(self) -> None:
+        """Drain queued messages on the Tk main thread, then reschedule."""
+        if self._log_relay_stopped:
+            return
+
+        messages = []
+
+        while len(messages) < 500:
+            try:
+                messages.append(self._log_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        if messages:
+            self._deliver_logs(messages)
+
+        try:
+            self._log_poll_after_id = self.window.after(
+                self.LOG_POLL_INTERVAL_MS, self._poll_logs
+            )
+        except Exception:
+            # Window is gone
+            self._log_relay_stopped = True
+
+    def _deliver_logs(self, messages) -> None:
+        """Show a batch of messages and update status/badges once."""
+        log_section = self.sections.get("log") if self.sections else None
+        last_status_text = None
+
+        for message, level in messages:
+            self._log_history.append((message, level))
+
+            if log_section is not None:
+                try:
+                    log_section.add_log(message, level)
+                except Exception:
+                    pass
+
+            _, status_text = self._classify_log_message(message, level)
+
+            if status_text:
+                last_status_text = status_text
+
+            if level == 'warning':
+                self.unread_warnings += 1
+            elif level == 'error':
+                self.unread_errors += 1
+
+        if last_status_text:
+            self._update_status_with_context(last_status_text)
+
+        if self.unread_warnings > 0 or self.unread_errors > 0:
+            self._update_log_button_badge()
+
+    def replay_history_into(self, log_section) -> None:
+        """Replays buffered messages into a newly opened log window."""
+        for message, level in list(self._log_history):
+            try:
+                log_section.add_log(message, level)
+            except Exception:
+                return
+
+    def _classify_log_message(self, message: str, level: str):
+        """Classify log message and extract context for status display."""
+        return classify_log_message(message, level)
+
+    def _update_log_button_badge(self):
+        """Update log button text and color based on unread messages"""
+        if "status" not in self.sections or "log_button" not in self.sections["status"]:
+            return
+
+        log_button = self.sections["status"]["log_button"]
+        if not log_button:
+            return
+
+        log_window = getattr(self.window, "log_window", None)
+        is_visible = bool(log_window and log_window.winfo_viewable())
+        update_log_button_badge(log_button, self.unread_warnings, self.unread_errors, is_visible)
+
+
+class EventHandlers(LogRelayMixin):
     """Handles all GUI events and callbacks"""
 
     def __init__(self, state, window):
@@ -22,13 +153,8 @@ class EventHandlers:
             progress_callback=self.on_progress, log_callback=self.on_log
         )
 
-        # Badge tracking for log button
-        self.unread_warnings = 0
-        self.unread_errors = 0
-
-        # Log message batching
-        self._log_queue = []
-        self._log_flush_scheduled = False
+        # Thread-safe log relay (queue drained on the Tk main loop)
+        self._init_log_relay()
 
     def set_sections(self, sections):
         """Set UI sections after layout is built"""
@@ -126,56 +252,6 @@ class EventHandlers:
                 text=f"Status: Error - {update.message[:50]}"
             )
 
-    def on_log(self, message, level="info"):
-        """Handle log messages - route to status, badge, and log window"""
-        if not hasattr(self, 'sections') or not self.sections:
-            return
-
-        # Add to queue for batching
-        self._log_queue.append((message, level))
-
-        # Schedule flush if not already scheduled
-        if not self._log_flush_scheduled:
-            self._log_flush_scheduled = True
-            self.window.after(150, self._flush_log_queue)
-
-    def _flush_log_queue(self):
-        """Process all queued log messages at once"""
-        if not self._log_queue:
-            self._log_flush_scheduled = False
-            return
-
-        # Process all queued logs
-        for message, level in self._log_queue:
-            # Always send to log window
-            if "log" in self.sections:
-                self.sections["log"].add_log(message, level)
-
-            # Classify message for status display
-            category, status_text = self._classify_log_message(message, level)
-
-            # Update status label if critical message (only for last message to avoid spam)
-            if status_text and "status" in self.sections and message == self._log_queue[-1][0]:
-                self._update_status_with_context(status_text)
-
-            # Update badge for warnings/errors
-            if level == "warning":
-                self.unread_warnings += 1
-            elif level == "error":
-                self.unread_errors += 1
-
-        # Update badge once after processing all messages
-        if self.unread_warnings > 0 or self.unread_errors > 0:
-            self._update_log_button_badge()
-
-        # Clear queue
-        self._log_queue.clear()
-        self._log_flush_scheduled = False
-
-    def _classify_log_message(self, message: str, level: str):
-        """Classify log message and extract context for status display."""
-        return classify_log_message(message, level)
-
     def _update_status_with_context(self, context: str):
         """Update status label with operational context"""
         if "status" not in self.sections or "label" not in self.sections["status"]:
@@ -183,19 +259,6 @@ class EventHandlers:
 
         status_label = self.sections["status"]["label"]
         update_status_with_context(status_label, context, platform_prefix="Status")
-
-    def _update_log_button_badge(self):
-        """Update log button text and color based on unread messages"""
-        if "status" not in self.sections or "log_button" not in self.sections["status"]:
-            return
-
-        log_button = self.sections["status"]["log_button"]
-        if not log_button:
-            return
-
-        log_window = getattr(self.window, "log_window", None)
-        is_visible = bool(log_window and log_window.winfo_viewable())
-        update_log_button_badge(log_button, self.unread_warnings, self.unread_errors, is_visible)
 
     def on_close(self):
         """Handle window close request - stop downloads if running"""
@@ -285,7 +348,7 @@ class EventHandlers:
         return {'added': added, 'skipped': skipped}
 
 
-class OnlyFansEventHandlers:
+class OnlyFansEventHandlers(LogRelayMixin):
     """Handles OnlyFans GUI events"""
 
     def __init__(self, state, window):
@@ -297,13 +360,8 @@ class OnlyFansEventHandlers:
             log_callback=self.on_log
         )
 
-        # Badge tracking for log button
-        self.unread_warnings = 0
-        self.unread_errors = 0
-
-        # Log message batching
-        self._log_queue = []
-        self._log_flush_scheduled = False
+        # Thread-safe log relay (queue drained on the Tk main loop)
+        self._init_log_relay()
 
     def set_sections(self, sections):
         """Set UI sections after layout is built"""
@@ -380,57 +438,11 @@ class OnlyFansEventHandlers:
         elif update.status == "error":
             self.sections["buttons"]["start"].configure(state="normal")
             self.sections["buttons"]["stop"].configure(state="disabled")
-            self.sections["status"]["label"].configure(text=f"OnlyFans: Error")
-
-    def on_log(self, message, level="info"):
-        """Handle log messages - route to status, badge, and log window"""
-        if not hasattr(self, 'sections') or not self.sections:
-            return
-
-        # Add to queue for batching
-        self._log_queue.append((message, level))
-
-        # Schedule flush if not already scheduled
-        if not self._log_flush_scheduled:
-            self._log_flush_scheduled = True
-            self.window.after(150, self._flush_log_queue)
-
-    def _flush_log_queue(self):
-        """Process all queued log messages at once"""
-        if not self._log_queue:
-            self._log_flush_scheduled = False
-            return
-
-        # Process all queued logs
-        for message, level in self._log_queue:
-            # Always send to log window
-            if "log" in self.sections:
-                self.sections["log"].add_log(message, level)
-
-            # Classify message for status display
-            category, status_text = self._classify_log_message(message, level)
-
-            # Update status label if critical message (only for last message to avoid spam)
-            if status_text and "status" in self.sections and message == self._log_queue[-1][0]:
-                self._update_status_with_context(status_text)
-
-            # Update badge for warnings/errors
-            if level == "warning":
-                self.unread_warnings += 1
-            elif level == "error":
-                self.unread_errors += 1
-
-        # Update badge once after processing all messages
-        if self.unread_warnings > 0 or self.unread_errors > 0:
-            self._update_log_button_badge()
-
-        # Clear queue
-        self._log_queue.clear()
-        self._log_flush_scheduled = False
-
-    def _classify_log_message(self, message: str, level: str):
-        """Classify log message and extract context for status display."""
-        return classify_log_message(message, level)
+            detail = (update.message or "").strip().splitlines()
+            detail_text = f" - {detail[0][:60]}" if detail else ""
+            self.sections["status"]["label"].configure(
+                text=f"OnlyFans: Error{detail_text}"
+            )
 
     def _update_status_with_context(self, context: str):
         """Update status label with operational context"""
@@ -439,19 +451,6 @@ class OnlyFansEventHandlers:
 
         status_label = self.sections["status"]["label"]
         update_status_with_context(status_label, context, platform_prefix="OnlyFans")
-
-    def _update_log_button_badge(self):
-        """Update log button text and color based on unread messages"""
-        if "status" not in self.sections or "log_button" not in self.sections["status"]:
-            return
-
-        log_button = self.sections["status"]["log_button"]
-        if not log_button:
-            return
-
-        log_window = getattr(self.window, "log_window", None)
-        is_visible = bool(log_window and log_window.winfo_viewable())
-        update_log_button_badge(log_button, self.unread_warnings, self.unread_errors, is_visible)
 
     def on_close(self):
         """Handle window close request - stop downloads if running"""

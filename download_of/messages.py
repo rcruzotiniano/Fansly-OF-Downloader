@@ -12,7 +12,8 @@ from config.onlyfans_config import OnlyFansConfig
 from download.downloadstate import DownloadState
 from download.state_manager import DownloadStateManager
 from textio import print_info, print_warning, print_error
-from .timeline import download_media_item, get_media_extension
+from .media_download import build_media_entry
+from .timeline import download_media_item
 
 
 def download_messages(config: OnlyFansConfig, state: DownloadState) -> None:
@@ -26,6 +27,9 @@ def download_messages(config: OnlyFansConfig, state: DownloadState) -> None:
     # Track totals for progress reporting
     total_media = 0
 
+    # Per-run counters (also shown in the GUI and the final summary)
+    stats = {'downloaded': 0, 'skipped': 0, 'drm': 0, 'failed': 0}
+
     # GUI progress callback helper
     def send_progress(current, total, filename='', status='running'):
         if config.gui_mode and config.progress_callback:
@@ -35,8 +39,8 @@ def download_messages(config: OnlyFansConfig, state: DownloadState) -> None:
                 'total': total,
                 'current_file': filename,
                 'status': status,
-                'duplicates': 0,
-                'downloaded': total_media
+                'duplicates': stats['skipped'],
+                'downloaded': stats['downloaded']
             })
 
     try:
@@ -147,7 +151,7 @@ def download_messages(config: OnlyFansConfig, state: DownloadState) -> None:
                             filename=media.get('filename', '')
                         )
 
-                        if download_media_item(config, state, media):
+                        if download_media_item(config, state, media, stats):
                             total_media += 1
                             session_new_items += 1
 
@@ -186,7 +190,18 @@ def download_messages(config: OnlyFansConfig, state: DownloadState) -> None:
 
         print_info(f"\n✓ Messages download complete!")
         print_info(f"  Messages processed: {total_messages}")
-        print_info(f"  Media downloaded: {total_media}")
+        print_info(f"  Media downloaded: {stats['downloaded']}")
+        print_info(f"  Already present (skipped): {stats['skipped']}")
+
+        if stats['drm']:
+            print_warning(f"  Skipped (DRM protected): {stats['drm']}")
+            print_info(
+                "  DRM protected media has no downloadable file on OnlyFans - "
+                "see docs/OnlyFans-Long-Videos.md"
+            )
+
+        if stats['failed']:
+            print_warning(f"  Failed: {stats['failed']}")
 
         # Send completion progress
         send_progress(
@@ -222,7 +237,7 @@ def parse_message_media(message: Dict, state: DownloadState) -> List[Dict]:
         state: Download state
 
     Returns:
-        List of media item dicts with url, filename, type
+        List of media item dicts with url, filename, type, raw media data
     """
     media_items = []
     message_id = message.get('id', 'unknown')
@@ -231,51 +246,18 @@ def parse_message_media(message: Dict, state: DownloadState) -> List[Dict]:
     media_array = message.get('media', [])
 
     for idx, media in enumerate(media_array):
-        media_id = media.get('id', idx)
-        media_type = media.get('type', 'unknown')  # 'photo', 'video', 'gif', 'audio'
+        media_item = build_media_entry(media, container_id=message_id, prefix='msg_')
 
-        # Get media URL - check multiple possible locations
-        # Videos often use 'source' field, photos use 'files.full.url'
-        url = None
-
-        # First check 'source' field (common for videos)
-        if 'source' in media:
-            source = media['source']
-            url = source.get('source') or source.get('url')
-
-        # If no source, check 'files' field (common for photos)
-        if not url and 'files' in media:
-            if 'full' in media['files']:
-                url = media['files']['full'].get('url')
-            else:
-                # Fallback: try other quality levels
-                files = media['files']
-                if isinstance(files, dict):
-                    for quality in ['source', 'full', 'preview']:
-                        if quality in files:
-                            file_obj = files[quality]
-                            if isinstance(file_obj, dict):
-                                url = file_obj.get('url')
-                            if url:
-                                break
-
-        if not url:
+        if media_item is None or not media_item['url']:
+            media_id = media.get('id', idx) if isinstance(media, dict) else idx
+            media_type = media.get('type', 'unknown') if isinstance(media, dict) else 'unknown'
             # This could be paywall-locked content or media with no accessible URL
-            print_warning(f"Could not find media URL for message {message_id}, media {media_id} (type: {media_type}) - may be paywall-locked")
+            print_warning(
+                f"Could not find media URL for message {message_id}, media "
+                f"{media_id} (type: {media_type}) - may be paywall-locked"
+            )
             continue
 
-        # Determine file extension
-        extension = get_media_extension(media_type, url)
-
-        # Create filename: msg_MessageID_MediaID.ext
-        filename = f"msg_{message_id}_{media_id}.{extension}"
-
-        media_items.append({
-            'id': media_id,
-            'type': media_type,
-            'url': url,
-            'filename': filename,
-            'message_id': message_id,
-        })
+        media_items.append(media_item)
 
     return media_items

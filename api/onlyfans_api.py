@@ -14,6 +14,50 @@ import requests
 import time
 from typing import Optional, Dict, List
 from api.onlyfans_auth import OnlyFansAuth
+from textio import print_warning
+
+
+#: OnlyFans' WAF/rate limiting sometimes rejects valid requests (typically with
+#: 400 "Please refresh the page"); waiting a moment and retrying usually works.
+RETRY_STATUS_CODES = frozenset({400, 401, 403, 429, 500, 502, 503, 504})
+
+#: Total attempts (first try + retries) for safe (GET) requests.
+RETRY_ATTEMPTS = 3
+
+#: Base delay between retries; grows linearly per attempt.
+RETRY_DELAY_SECONDS = 2.0
+
+
+def describe_api_error(response) -> str:
+    """Extracts OnlyFans' own error message from a failed response.
+
+    OnlyFans answers errors like ``{"error": {"code": 401, "message": "..."}}``;
+    ``requests``' generic "400 Client Error" hides that, which made failures
+    impossible to diagnose from the GUI.
+    """
+
+    message = ''
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get('error')
+
+        if isinstance(error, dict):
+            message = str(error.get('message') or '')
+        elif error:
+            message = str(error)
+
+        if not message:
+            message = str(payload.get('message') or '')
+
+    if not message:
+        message = (response.text or '').strip()[:200]
+
+    return message or 'no details in the response'
 
 
 class OnlyFansApi:
@@ -88,17 +132,46 @@ class OnlyFansApi:
         if 'cookies' in kwargs:
             cookies.update(kwargs.pop('cookies'))
 
-        # Make request
-        response = self.session.request(
-            method=method,
-            url=url,
-            headers=headers,
-            cookies=cookies,
-            **kwargs
-        )
+        # OnlyFans sporadically rejects perfectly valid requests with 400/401
+        # ("Please refresh the page") - their WAF does this, and a retry a few
+        # seconds later usually succeeds. Only retry safe (GET) requests.
+        attempts = RETRY_ATTEMPTS if method.upper() == 'GET' else 1
+        response = None
 
-        # Raise for HTTP errors
-        response.raise_for_status()
+        for attempt in range(1, attempts + 1):
+            # Re-sign on every attempt: the signature embeds a timestamp
+            if attempt > 1:
+                headers = self.auth.get_headers(url)
+
+                if 'headers' in kwargs:
+                    headers.update(kwargs['headers'])
+
+            response = self.session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                cookies=cookies,
+                **kwargs
+            )
+
+            if response.status_code not in RETRY_STATUS_CODES or attempt >= attempts:
+                break
+
+            delay = RETRY_DELAY_SECONDS * attempt
+            print_warning(
+                f'OnlyFans responded {response.status_code} '
+                f'({describe_api_error(response)}) - retrying in {delay:.0f}s '
+                f'({attempt}/{attempts - 1})'
+            )
+            time.sleep(delay)
+
+        # Raise for HTTP errors, with OnlyFans' own reason in the message
+        if response is not None and response.status_code >= 400:
+            raise requests.HTTPError(
+                f'OnlyFans API error {response.status_code}: '
+                f'{describe_api_error(response)}',
+                response=response,
+            )
 
         return response
 

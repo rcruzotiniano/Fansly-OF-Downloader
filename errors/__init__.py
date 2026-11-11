@@ -106,6 +106,18 @@ class M3U8Error(MediaError):
     def __init__(self, *args):
         super().__init__(*args)
 
+
+class DRMProtectedError(MediaError):
+    """This error is raised when a media item is DRM protected and OnlyFans
+    offers no plain, downloadable file for it.
+
+    This is expected for some OnlyFans videos (typically the longer ones): the
+    API then only exposes encrypted HLS/DASH manifests plus a preview image.
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
 #endregion
 
 
@@ -125,6 +137,7 @@ __all__ = [
     'ApiAccountInfoError',
     'ApiAuthenticationError',
     'ConfigError',
+    'DRMProtectedError',
     'DownloadError',
     'DuplicateCountError',
     'MediaError',

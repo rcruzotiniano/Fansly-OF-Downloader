@@ -59,14 +59,29 @@ For detailed configuration settings, see the [Wiki](https://github.com/Frangus90
 
 #### Python (All Platforms)
 
-**Requirements:** Python 3.11 or higher
+**Requirements:** Python 3.11 or higher (3.11/3.12 recommended — newer versions may not have wheels for every pinned dependency)
 
 1. Clone or download this repository
-2. Install dependencies:
+2. Create a virtual environment and install dependencies:
 
    ```bash
-   pip install -r requirements.txt
+   python -m venv .venv
+   .venv\Scripts\Activate.ps1                # Windows PowerShell
+   # source .venv/bin/activate               # Linux / macOS
+
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
    ```
+
+   If `pip` appears to hang while fetching package metadata, retry with
+   `--no-cache-dir` (a corrupt local pip cache is the usual cause):
+
+   ```bash
+   python -m pip install --no-cache-dir -r requirements.txt
+   ```
+
+   If `Activate.ps1` is blocked, allow it for the current session only:
+   `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`.
 
 3. Run the GUI:
 
@@ -80,7 +95,7 @@ For detailed configuration settings, see the [Wiki](https://github.com/Frangus90
    python fansly_downloader_ng.py
    ```
 
-**Note:** Using a [Python virtual environment](https://docs.python.org/3/library/venv.html) is recommended but out-of-scope of this guide.
+**Note:** A virtual environment keeps these packages separate from your system Python; installing globally also works (`python -m pip install -r requirements.txt`).
 
 On Linux, you may need to install Tkinter separately:
 
@@ -257,6 +272,23 @@ pip install -r requirements-dev.txt
 * Check log file for errors
 * Ensure active creator subscriptions
 
+**OnlyFans: long videos download as an image in an `.mp4` file:**
+* OnlyFans serves longer videos as DRM protected streams and only exposes a preview image (no plain MP4), so they cannot be downloaded with a normal HTTP request. The program now detects this, warns instead of writing a fake video, and repairs existing broken files on the next run.
+* Scan / repair a folder you already downloaded:
+  ```bash
+  python tools/of_media_doctor.py scan "<Downloads>\<creator>-of\Timeline"
+  python tools/of_media_doctor.py repair "<Downloads>\<creator>-of\Timeline"
+  ```
+* Details: [docs/OnlyFans-Long-Videos.md](docs/OnlyFans-Long-Videos.md)
+
+**OnlyFans: "400 Client Error" / "Failed to get account info":**
+* OnlyFans' firewall sometimes rejects a perfectly valid request; the client now retries a few times automatically.
+* If it keeps failing, check the credentials against the live API:
+  ```bash
+  python tools/of_auth_check.py            # or: python tools/of_auth_check.py <creator>
+  ```
+  It prints OnlyFans' own reason and what to do (usually: reload onlyfans.com in the browser and copy `sess`, `auth_id`, `x-bc` and `user_agent` again from that same session).
+
 **Application crashes:**
 * Check `fansly_downloader.log` in app directory
 * Delete `config.ini` and `gui_state.json` for fresh setup
@@ -279,6 +311,9 @@ A: There are no guarantees. The tool respects rate limits and mimics normal brow
 
 **Q: Does this bypass paywalls?**
 A: No. You can only download content you have legitimate access to through your subscriptions. No paywall bypassing features will be added.
+
+**Q: Why is an OnlyFans video saved as a picture (or not downloaded at all)?**
+A: Longer OnlyFans videos are DRM protected: the API only offers an encrypted HLS/DASH stream plus a preview image, and no plain MP4 exists. Such media is now detected and reported instead of being saved as a broken `.mp4` file; see [docs/OnlyFans-Long-Videos.md](docs/OnlyFans-Long-Videos.md).
 
 **Q: Why do antivirus programs flag the executable?**
 A: The executable is not digitally signed (certificates are expensive), causing false positives. Build your own from source or run the Python version directly.

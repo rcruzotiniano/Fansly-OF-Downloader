@@ -54,6 +54,11 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+.testtmp/
+.e2e/
+
+# Local test dependencies (installed with `pip install --target`)
+.testlibs/
 
 # Translations
 *.mo

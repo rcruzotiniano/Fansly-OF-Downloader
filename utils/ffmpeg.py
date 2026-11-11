@@ -1,21 +1,26 @@
 """FFmpeg Launcher Module"""
 
 
-import platform
 import shutil
 import subprocess
 
 
 def get_ffmpeg_bin() -> str:
-    ffmpeg_bin = None
+    """Returns a usable ffmpeg binary path.
 
-    if platform.system() == 'Linux':
-        ffmpeg_bin = shutil.which("ffmpeg")
+    A system ffmpeg (PATH) is preferred: it starts faster, respects the user's
+    configuration and does not need a writable ``~/.pyffmpeg`` folder. The
+    pyffmpeg bundled binary is used as a fallback for systems without ffmpeg.
+    """
 
-    if ffmpeg_bin is None:
-        from pyffmpeg import FFmpeg
-        ffmpeg = FFmpeg(enable_log=False)
-        ffmpeg_bin = ffmpeg.get_ffmpeg_bin()
+    ffmpeg_bin = shutil.which("ffmpeg")
+
+    if ffmpeg_bin:
+        return ffmpeg_bin
+
+    from pyffmpeg import FFmpeg
+    ffmpeg = FFmpeg(enable_log=False)
+    ffmpeg_bin = ffmpeg.get_ffmpeg_bin()
 
     return ffmpeg_bin
 

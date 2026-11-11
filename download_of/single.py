@@ -97,6 +97,8 @@ def download_single_post_of(config: OnlyFansConfig, state: DownloadState) -> Non
 
         # Download each media item
         downloaded = 0
+        stats = {'downloaded': 0, 'skipped': 0, 'drm': 0, 'failed': 0}
+
         for idx, media in enumerate(media_items):
             # Check stop flag
             if config.stop_flag and config.stop_flag.is_set():
@@ -122,12 +124,21 @@ def download_single_post_of(config: OnlyFansConfig, state: DownloadState) -> Non
                 filename=media.get('filename', '')
             )
 
-            if download_media_item(config, state, media):
+            if download_media_item(config, state, media, stats):
                 downloaded += 1
                 total_media += 1
 
         print_info(f"\n Single post download complete!")
         print_info(f"  Downloaded: {downloaded} of {len(media_items)} items")
+
+        if stats['skipped']:
+            print_info(f"  Already present (skipped): {stats['skipped']}")
+
+        if stats['drm']:
+            print_warning(f"  Skipped (DRM protected): {stats['drm']}")
+
+        if stats['failed']:
+            print_warning(f"  Failed: {stats['failed']}")
 
         # Send completion progress
         send_progress(

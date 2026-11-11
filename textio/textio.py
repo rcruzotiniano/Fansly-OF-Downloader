@@ -26,6 +26,16 @@ _registered_levels: set[str] = set()
 # Remove loguru's default stderr handler
 logger.remove()
 
+# Windows consoles/pipes often use a legacy code page (cp1252, cp850, ...),
+# which cannot encode characters like "✓" or "⊘" used in log messages and
+# would make loguru raise UnicodeEncodeError on every such message.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, ValueError, OSError):
+    # Not a text stream (e.g. the GUI's redirected stdout) - nothing to do
+    pass
+
 # Minimum level across all custom levels is 1 (Info), so set handler level to 1
 # to ensure all custom levels are captured.
 logger.add(

@@ -10,7 +10,19 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from config.onlyfans_config import OnlyFansConfig
 from download.downloadstate import DownloadState
-from textio import print_info, print_warning, print_error
+from errors import DRMProtectedError, DownloadError, MediaError
+from textio import print_debug, print_info, print_warning, print_error
+from .media_download import (
+    StopRequested,
+    build_cookie_header,
+    build_media_entry,
+    build_media_headers,
+    download_media_source,
+    get_media_cookies,
+    is_fake_video_file,
+    print_drm_detail_once,
+    print_drm_notice_once,
+)
 
 
 def download_timeline(config: OnlyFansConfig, state: DownloadState) -> None:
@@ -24,6 +36,9 @@ def download_timeline(config: OnlyFansConfig, state: DownloadState) -> None:
     # Track totals for progress reporting
     total_media = 0
 
+    # Per-run counters (also shown in the GUI and the final summary)
+    stats = {'downloaded': 0, 'skipped': 0, 'drm': 0, 'failed': 0}
+
     # GUI progress callback helper
     def send_progress(current, total, filename='', status='running'):
         if config.gui_mode and config.progress_callback:
@@ -33,8 +48,8 @@ def download_timeline(config: OnlyFansConfig, state: DownloadState) -> None:
                 'total': total,
                 'current_file': filename,
                 'status': status,
-                'duplicates': 0,
-                'downloaded': total_media
+                'duplicates': stats['skipped'],
+                'downloaded': stats['downloaded']
             })
 
     try:
@@ -130,8 +145,13 @@ def download_timeline(config: OnlyFansConfig, state: DownloadState) -> None:
                             filename=media.get('filename', '')
                         )
 
-                        if download_media_item(config, state, media):
+                        if download_media_item(config, state, media, stats):
                             total_media += 1
+                            send_progress(
+                                current=total_media,
+                                total=total_media + len(media_items),
+                                filename=media.get('filename', '')
+                            )
 
                     # If stopped during media downloads, break from post loop too
                     if config.stop_flag and config.stop_flag.is_set():
@@ -176,7 +196,18 @@ def download_timeline(config: OnlyFansConfig, state: DownloadState) -> None:
 
         print_info(f"\n✓ Timeline download complete!")
         print_info(f"  Posts processed: {total_posts}")
-        print_info(f"  Media downloaded: {total_media}")
+        print_info(f"  Media downloaded: {stats['downloaded']}")
+        print_info(f"  Already present (skipped): {stats['skipped']}")
+
+        if stats['drm']:
+            print_warning(f"  Skipped (DRM protected): {stats['drm']}")
+            print_info(
+                "  DRM protected videos have no downloadable file on OnlyFans - "
+                "see docs/OnlyFans-Long-Videos.md"
+            )
+
+        if stats['failed']:
+            print_warning(f"  Failed: {stats['failed']}")
 
         # Send completion progress
         send_progress(
@@ -202,7 +233,7 @@ def parse_post_media(post: Dict, state: DownloadState) -> List[Dict]:
         state: Download state
 
     Returns:
-        List of media item dicts with url, filename, type
+        List of media item dicts with url, filename, type, raw media data
     """
     media_items = []
     post_id = post.get('id', 'unknown')
@@ -211,51 +242,20 @@ def parse_post_media(post: Dict, state: DownloadState) -> List[Dict]:
     media_array = post.get('media', [])
 
     for idx, media in enumerate(media_array):
-        media_id = media.get('id', idx)
-        media_type = media.get('type', 'unknown')  # 'photo', 'video', 'gif', 'audio'
+        media_item = build_media_entry(media, container_id=post_id)
 
-        # Get media URL
-        # Check different possible URL locations
-        media_url = None
-
-        if 'source' in media:
-            source = media['source']
-            media_url = source.get('source') or source.get('url')
-
-        if not media_url and 'files' in media:
-            # Try files array
-            files = media['files']
-            if isinstance(files, dict):
-                # Get highest quality
-                for quality in ['source', 'full', 'preview']:
-                    if quality in files:
-                        media_url = files[quality].get('url')
-                        if media_url:
-                            break
-
-        if not media_url:
+        if media_item is None or not media_item['url']:
+            media_id = media.get('id', idx) if isinstance(media, dict) else idx
             print_warning(f"Could not find media URL for {media_id}")
             continue
 
-        # Determine file extension
-        extension = get_media_extension(media_type, media_url)
-
-        # Create filename: PostID_MediaID.ext
-        filename = f"{post_id}_{media_id}.{extension}"
-
-        media_items.append({
-            'id': media_id,
-            'type': media_type,
-            'url': media_url,
-            'filename': filename,
-            'post_id': post_id,
-        })
+        media_items.append(media_item)
 
     return media_items
 
 
 def download_media_item(config: OnlyFansConfig, state: DownloadState,
-                        media: Dict) -> bool:
+                        media: Dict, stats: Optional[Dict] = None) -> bool:
     """
     Download single media item
 
@@ -265,50 +265,96 @@ def download_media_item(config: OnlyFansConfig, state: DownloadState,
         media: Media item dict
 
     Returns:
-        True if downloaded successfully, False if skipped
+        True if downloaded successfully, False if skipped or failed
     """
-    file_path = state.base_path / media['filename']
+    def note(kind: str) -> None:
+        """Counts the outcome of this item (when a stats dict was provided)."""
+        if stats is not None:
+            stats[kind] = stats.get(kind, 0) + 1
 
-    # Skip if exists
-    if file_path.exists():
-        if config.show_skipped_downloads:
-            print_info(f"  ⊘ Skipping (exists): {media['filename']}")
+    filename = media.get('filename') or ''
+    media_type = media.get('type', 'unknown')
+    base_path = state.base_path
+
+    if base_path is None:
+        print_error("Internal error: download path not set")
+        note('failed')
         return False
+
+    stem = Path(filename).stem
+    file_path = base_path / filename
+
+    # Skip if exists - but repair files older versions saved as "video" that
+    # actually contain only the preview image of a DRM protected video.
+    if file_path.exists():
+        if media_type == 'video' and is_fake_video_file(file_path):
+            print_warning(f"  ↻ Replacing broken file (no video inside): {filename}")
+            file_path.unlink(missing_ok=True)
+        else:
+            if config.show_skipped_downloads:
+                print_info(f"  ⊘ Skipping (exists): {filename}")
+            note('skipped')
+            return False
+
+    # Remove leftover preview images from earlier broken attempts
+    if media_type == 'video':
+        for leftover in base_path.glob(f"{stem}.preview.*"):
+            leftover.unlink(missing_ok=True)
 
     try:
         if config.show_downloads:
-            print_info(f"  ↓ Downloading: {media['filename']}")
+            print_info(f"  ↓ Downloading: {filename}")
 
-        # Download file
-        response = requests.get(media['url'], stream=True, timeout=60)
-        response.raise_for_status()
+        api = config.get_api()
 
-        # Write to file
-        stopped = False
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                # Check stop flag during download
-                if config.stop_flag and config.stop_flag.is_set():
-                    print_warning(f"  ⊘ Download stopped: {media['filename']}")
-                    stopped = True
-                    break  # Exit loop, let file close
+        outcome = download_media_source(
+            session=api.session,
+            media_raw=media.get('raw') or {'source': {'source': media.get('url')}},
+            dest_dir=base_path,
+            stem=stem,
+            headers=build_media_headers(config),
+            cookies=get_media_cookies(api),
+            cookie_header=build_cookie_header(config),
+            media_type=media_type,
+            expected_duration=media.get('duration'),
+            stop_flag=config.stop_flag,
+            max_retries=config.max_retries,
+        )
 
-                if chunk:
-                    f.write(chunk)
+        if outcome.kind == 'video':
+            note('downloaded')
+            return True
 
-        # Clean up partial file if stopped (file is now closed)
-        if stopped:
-            if file_path.exists():
-                file_path.unlink()
-            return False
+        if outcome.kind == 'image' and media_type in ('photo', 'image', 'gif'):
+            note('downloaded')
+            return True
 
-        return True
+        print_warning(
+            f"  ⊘ No downloadable video for {filename} - "
+            f"OnlyFans only served a preview image"
+        )
+        note('failed')
+        return False
 
-    except Exception as e:
-        print_error(f"  ✗ Failed to download {media['filename']}: {e}")
-        # Remove partial file
-        if file_path.exists():
-            file_path.unlink()
+    except StopRequested:
+        print_warning(f"  ⊘ Download stopped: {filename}")
+        return False  # not counted: the run was interrupted
+
+    except DRMProtectedError as error:
+        print_warning(f"  ⊘ Skipped (DRM protected): {filename}")
+        print_drm_notice_once()
+        print_drm_detail_once(str(error))
+        note('drm')
+        return False
+
+    except (MediaError, DownloadError) as error:
+        print_error(f"  ✗ Failed to download {filename}: {error}")
+        note('failed')
+        return False
+
+    except Exception as error:
+        print_error(f"  ✗ Failed to download {filename}: {error}")
+        note('failed')
         return False
 
 
